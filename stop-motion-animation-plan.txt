@@ -1,0 +1,16 @@
+The program runs a stop motion animation booth for a kids fair.
+Hardware: 
+- Windows 11 desktop (HP optiplex sff 5050)
+- webcam (currently Diccik 1080p but looking to upgrade)
+- arduino connected to 4 or 5 momentary push buttons
+
+I expect the software to allow a child with little knowledge or attention 
+span to be able to make simple videos.
+the green button will take a picture.
+the red button will delete the last picture taken.
+the blue button will make the movie and display it to them
+the white and black buttons will act as answers to yes/no questions-
+for instance "save this movie and upload to cloud for storage (white) or 
+continue working (black)"
+the yellow button will turn onion skinning on and off.
+

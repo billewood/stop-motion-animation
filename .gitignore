@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+sessions/
+saved_movies/
+cloud_outbox/
+.DS_Store
