@@ -1,33 +1,38 @@
 """
 Stop-motion animation booth for kids fair.
 
-Hardware:
-  - Windows 11 desktop
-  - USB webcam (OpenCV index, default 0)
-  - Arduino sending single-char button events over serial:
-      G = green  -> take picture
-      R = red    -> delete last picture
-      B = blue   -> build movie and play it back
-      W = white  -> yes (save / upload current movie)
-      K = black  -> no  (keep working)
-      Y = yellow -> toggle onion skin
+Capture backends:
+  - digicam: Canon (e.g. T3) or other DSLR via digiCamControl's HTTP webserver.
+             Enable it in digiCamControl: File -> Settings -> Webserver.
+             Default URL http://localhost:5513. Start live view in the app
+             (or let this program start it) before running.
+  - webcam:  USB webcam via OpenCV, for bench testing without the DSLR.
+
+Arduino sends a single ASCII char per button press over USB serial @ 9600:
+  G green  -> take picture
+  R red    -> delete last picture
+  B blue   -> build movie and play it back
+  W white  -> yes (save & queue for cloud upload)
+  K black  -> no  (keep working)
+  Y yellow -> toggle onion skin
+
+Keyboard fallback with --port none: g/r/b/w/k/y mirror the buttons; q quits.
 
 Setup (Windows):
     py -m venv .venv
     .venv\\Scripts\\activate
     pip install -r requirements.txt
-    python booth.py --port COM3
-
-Run with --port none to test with keyboard only:
-    g/r/b/w/k/y mirror the buttons; q quits.
+    python booth.py --backend digicam --port COM3
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -40,17 +45,25 @@ try:
 except ImportError:
     serial = None
 
+try:
+    import requests
+except ImportError:
+    requests = None
+
 
 # ---- Configuration ----------------------------------------------------------
 
 FPS = 6                       # playback frame rate for the finished movie
 ONION_OPACITY = 0.40          # blend strength of previous frame on live preview
+MOVIE_WIDTH = 1280            # downscale target for the rendered movie
 WINDOW_NAME = 'Stop Motion Booth'
 SESSIONS_DIR = Path('sessions')
 SAVED_DIR = Path('saved_movies')
-CLOUD_DIR = Path('cloud_outbox')   # files dropped here get picked up by uploader
+CLOUD_DIR = Path('cloud_outbox')   # external uploader picks files up from here
 
 SERIAL_BAUD = 9600
+DIGICAM_DEFAULT_URL = 'http://localhost:5513'
+DIGICAM_CAPTURE_TIMEOUT_S = 20.0
 
 
 # ---- Button event source ----------------------------------------------------
@@ -90,37 +103,169 @@ class ButtonSource:
             self.ser.close()
 
 
+# ---- Capture backends -------------------------------------------------------
+
+class WebcamBackend:
+    """OpenCV USB webcam (used for testing without the DSLR)."""
+
+    def __init__(self, index: int = 0):
+        flag = cv2.CAP_DSHOW if os.name == 'nt' else 0
+        self.cap = cv2.VideoCapture(index, flag)
+        if not self.cap.isOpened():
+            raise RuntimeError(f'Could not open camera index {index}')
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    def read_preview(self) -> np.ndarray | None:
+        ok, frame = self.cap.read()
+        return frame if ok else None
+
+    def capture(self, stem: Path) -> Path | None:
+        ok, frame = self.cap.read()
+        if not ok:
+            return None
+        path = stem.with_suffix('.jpg')
+        cv2.imwrite(str(path), frame)
+        return path
+
+    def release(self):
+        self.cap.release()
+
+
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _strip_html(text: str) -> str:
+    return _HTML_TAG_RE.sub('', text).strip()
+
+
+class DigiCamBackend:
+    """Canon / Nikon / Sony DSLR via digiCamControl HTTP single-line commands.
+
+    Docs: http://digicamcontrol.com/doc/userguide/web (Webserver + SLC).
+    The webserver must be enabled in digiCamControl settings.
+    """
+
+    def __init__(self, base_url: str = DIGICAM_DEFAULT_URL):
+        if requests is None:
+            raise RuntimeError('requests not installed; run: pip install requests')
+        self.base = base_url.rstrip('/')
+        # Prime connectivity and try to start live view so /liveview.jpg serves.
+        self._slc({'slc': 'list', 'param1': 'cameras'})  # raises if unreachable
+        self._try_start_liveview()
+
+    def _slc(self, params: dict) -> str:
+        r = requests.get(self.base, params=params, timeout=5)
+        r.raise_for_status()
+        return _strip_html(r.text)
+
+    def _try_start_liveview(self):
+        # Best-effort; different digiCamControl versions expose slightly different
+        # verbs. Either of these will start live view on modern builds.
+        for params in (
+            {'slc': 'do', 'param1': 'LiveViewWnd_Show'},
+            {'slc': 'LiveViewWnd_Show'},
+        ):
+            try:
+                self._slc(params)
+                break
+            except Exception:
+                continue
+
+    def _get_last_captured(self) -> str:
+        try:
+            return self._slc({'slc': 'get', 'param1': 'lastcaptured'})
+        except Exception:
+            return ''
+
+    def read_preview(self) -> np.ndarray | None:
+        try:
+            r = requests.get(f'{self.base}/liveview.jpg', timeout=1.5)
+            if r.status_code != 200 or not r.content:
+                return None
+            arr = np.frombuffer(r.content, dtype=np.uint8)
+            return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        except Exception:
+            return None
+
+    def capture(self, stem: Path) -> Path | None:
+        before = self._get_last_captured()
+        try:
+            self._slc({'slc': 'capture'})
+        except Exception:
+            return None
+        deadline = time.time() + DIGICAM_CAPTURE_TIMEOUT_S
+        while time.time() < deadline:
+            current = self._get_last_captured()
+            if current and current != before:
+                src = Path(current)
+                if src.exists():
+                    dest = stem.with_suffix(src.suffix.lower() or '.jpg')
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        shutil.move(str(src), str(dest))
+                    except OSError:
+                        shutil.copy2(src, dest)
+                    return dest
+            time.sleep(0.15)
+        return None
+
+    def release(self):
+        try:
+            self._slc({'slc': 'do', 'param1': 'LiveViewWnd_Hide'})
+        except Exception:
+            pass
+
+
 # ---- Session state ----------------------------------------------------------
 
 class Session:
-    """One animation session: a folder of numbered JPEGs."""
+    """One animation session: a folder of numbered image files."""
 
     def __init__(self, root: Path):
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.dir = root / stamp
         self.dir.mkdir(parents=True, exist_ok=True)
         self.frames: list[Path] = []
+        self._preview_cache: dict[tuple[str, int], np.ndarray] = {}
 
-    def add(self, frame_bgr: np.ndarray) -> Path:
-        path = self.dir / f'frame_{len(self.frames):04d}.jpg'
-        cv2.imwrite(str(path), frame_bgr)
+    def next_stem(self) -> Path:
+        return self.dir / f'frame_{len(self.frames):04d}'
+
+    def register(self, path: Path):
         self.frames.append(path)
-        return path
 
     def pop(self) -> Path | None:
         if not self.frames:
             return None
         path = self.frames.pop()
+        self._preview_cache = {k: v for k, v in self._preview_cache.items()
+                               if k[0] != str(path)}
         try:
             path.unlink()
         except OSError:
             pass
         return path
 
-    def last_frame(self) -> np.ndarray | None:
+    def last_frame_scaled(self, target_w: int) -> np.ndarray | None:
+        """Return last captured frame downscaled to roughly target_w wide."""
         if not self.frames:
             return None
-        return cv2.imread(str(self.frames[-1]))
+        p = self.frames[-1]
+        key = (str(p), target_w)
+        cached = self._preview_cache.get(key)
+        if cached is not None:
+            return cached
+        img = cv2.imread(str(p))
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        if w > target_w:
+            img = cv2.resize(img, (target_w, int(h * target_w / w)))
+        # Keep the cache tiny — we only ever want the most recent frame cached.
+        self._preview_cache.clear()
+        self._preview_cache[key] = img
+        return img
 
     def cleanup_if_empty(self):
         if not self.frames and self.dir.exists():
@@ -132,8 +277,8 @@ class Session:
 
 # ---- Rendering helpers ------------------------------------------------------
 
-def draw_hud(frame: np.ndarray, frames_count: int, onion: bool) -> np.ndarray:
-    """Top banner with frame count + onion-skin status, large and friendly."""
+def draw_hud(frame: np.ndarray, frames_count: int, onion: bool,
+             capturing: bool) -> np.ndarray:
     out = frame.copy()
     h, w = out.shape[:2]
     cv2.rectangle(out, (0, 0), (w, 70), (0, 0, 0), -1)
@@ -142,6 +287,9 @@ def draw_hud(frame: np.ndarray, frames_count: int, onion: bool) -> np.ndarray:
     if onion:
         cv2.putText(out, 'ONION', (w - 200, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 220, 255), 3)
+    if capturing:
+        cv2.putText(out, 'CAPTURING...', (w // 2 - 200, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 255), 5)
     return out
 
 
@@ -174,23 +322,31 @@ def build_movie(session: Session) -> Path | None:
     if not session.frames:
         return None
     first = cv2.imread(str(session.frames[0]))
-    h, w = first.shape[:2]
+    if first is None:
+        return None
+    h0, w0 = first.shape[:2]
+    if w0 > MOVIE_WIDTH:
+        scale = MOVIE_WIDTH / w0
+        out_w, out_h = MOVIE_WIDTH, int(h0 * scale)
+    else:
+        out_w, out_h = w0, h0
+
     out_path = session.dir / 'movie.mp4'
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(str(out_path), fourcc, FPS, (w, h))
+    writer = cv2.VideoWriter(str(out_path), fourcc, FPS, (out_w, out_h))
     for p in session.frames:
         img = cv2.imread(str(p))
         if img is None:
             continue
-        if img.shape[:2] != (h, w):
-            img = cv2.resize(img, (w, h))
+        if img.shape[1] != out_w or img.shape[0] != out_h:
+            img = cv2.resize(img, (out_w, out_h))
         writer.write(img)
     writer.release()
     return out_path
 
 
 def play_movie(path: Path, buttons: ButtonSource) -> None:
-    """Play movie once, looping until any button press."""
+    """Play movie looping until any button press (or q)."""
     while True:
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
@@ -217,18 +373,21 @@ def play_movie(path: Path, buttons: ButtonSource) -> None:
 
 # ---- Main loop --------------------------------------------------------------
 
-def run(camera_index: int, port: str | None, fullscreen: bool) -> int:
+def make_backend(kind: str, camera_index: int, digicam_url: str):
+    if kind == 'webcam':
+        return WebcamBackend(camera_index)
+    if kind == 'digicam':
+        return DigiCamBackend(digicam_url)
+    raise ValueError(f'Unknown backend: {kind}')
+
+
+def run(backend_kind: str, camera_index: int, digicam_url: str,
+        port: str | None, fullscreen: bool) -> int:
     SESSIONS_DIR.mkdir(exist_ok=True)
     SAVED_DIR.mkdir(exist_ok=True)
     CLOUD_DIR.mkdir(exist_ok=True)
 
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW if os.name == 'nt' else 0)
-    if not cap.isOpened():
-        print(f'Could not open camera index {camera_index}', file=sys.stderr)
-        return 2
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
+    backend = make_backend(backend_kind, camera_index, digicam_url)
     buttons = ButtonSource(port)
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -238,17 +397,37 @@ def run(camera_index: int, port: str | None, fullscreen: bool) -> int:
 
     session = Session(SESSIONS_DIR)
     onion = False
-    flash_until = 0.0   # brief white flash after capture
+    flash_until = 0.0
     pending_save: Path | None = None
+    capture_state = {'in_flight': False, 'last_preview': None}
+
+    def do_capture():
+        try:
+            path = backend.capture(session.next_stem())
+            if path is not None:
+                session.register(path)
+        finally:
+            capture_state['in_flight'] = False
 
     try:
         while True:
-            ok, live = cap.read()
-            if not ok:
-                continue
+            live = backend.read_preview()
+            if live is None:
+                # Fall back to the last good preview so the UI doesn't flicker to black
+                # (happens briefly during DSLR capture when the mirror is up).
+                live = capture_state['last_preview']
+                if live is None:
+                    time.sleep(0.05)
+                    # give the UI a chance to pump events so window stays responsive
+                    cv2.waitKey(1)
+                    continue
+            else:
+                capture_state['last_preview'] = live.copy()
 
-            display = apply_onion(live, session.last_frame() if onion else None)
-            display = draw_hud(display, len(session.frames), onion)
+            prev = session.last_frame_scaled(live.shape[1]) if onion else None
+            display = apply_onion(live, prev)
+            display = draw_hud(display, len(session.frames), onion,
+                               capture_state['in_flight'])
 
             if pending_save is not None:
                 display = big_message(display, [
@@ -271,14 +450,12 @@ def run(camera_index: int, port: str | None, fullscreen: bool) -> int:
                 continue
 
             if pending_save is not None:
-                # Yes/No prompt active — only white/black do anything.
                 if event == 'W':
                     saved = SAVED_DIR / f'{session.dir.name}.mp4'
                     shutil.copy2(pending_save, saved)
                     shutil.copy2(pending_save, CLOUD_DIR / saved.name)
                     print(f'Saved {saved} (queued for cloud upload)')
                     pending_save = None
-                    # start a fresh session
                     session.cleanup_if_empty()
                     session = Session(SESSIONS_DIR)
                     onion = False
@@ -286,9 +463,15 @@ def run(camera_index: int, port: str | None, fullscreen: bool) -> int:
                     pending_save = None
                 continue
 
+            # Block further input while a capture is in flight — DSLR takes ~1-2s
+            # per shot and we don't want a second press to queue up.
+            if capture_state['in_flight']:
+                continue
+
             if event == 'G':
-                session.add(live)
+                capture_state['in_flight'] = True
                 flash_until = time.time() + 0.12
+                threading.Thread(target=do_capture, daemon=True).start()
             elif event == 'R':
                 session.pop()
             elif event == 'Y':
@@ -298,11 +481,13 @@ def run(camera_index: int, port: str | None, fullscreen: bool) -> int:
                 if movie is not None:
                     play_movie(movie, buttons)
                     pending_save = movie
-            # white/black outside of prompt: ignore
 
     finally:
-        cap.release()
         buttons.close()
+        try:
+            backend.release()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
         session.cleanup_if_empty()
     return 0
@@ -310,12 +495,18 @@ def run(camera_index: int, port: str | None, fullscreen: bool) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description='Stop-motion animation booth')
-    p.add_argument('--camera', type=int, default=0, help='OpenCV camera index')
+    p.add_argument('--backend', choices=('digicam', 'webcam'), default='digicam',
+                   help='Capture backend (default: digicam)')
+    p.add_argument('--camera', type=int, default=0,
+                   help='OpenCV camera index (webcam backend only)')
+    p.add_argument('--digicam-url', default=DIGICAM_DEFAULT_URL,
+                   help=f'digiCamControl webserver URL (default {DIGICAM_DEFAULT_URL})')
     p.add_argument('--port', default='none',
                    help='Arduino serial port (e.g. COM3) or "none" for keyboard')
     p.add_argument('--windowed', action='store_true', help='Disable fullscreen')
     args = p.parse_args()
-    return run(args.camera, args.port, fullscreen=not args.windowed)
+    return run(args.backend, args.camera, args.digicam_url, args.port,
+               fullscreen=not args.windowed)
 
 
 if __name__ == '__main__':

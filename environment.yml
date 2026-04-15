@@ -1,0 +1,9 @@
+name: stopmotion
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - opencv>=4.10
+  - numpy>=1.26
+  - pyserial>=3.5
+  - requests>=2.32
