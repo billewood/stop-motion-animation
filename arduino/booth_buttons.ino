@@ -9,7 +9,6 @@
  *   R = red     (delete last picture)
  *   B = blue    (build & play movie)
  *   W = white   (yes / save & upload)
- *   K = black   (no  / keep working)
  *   Y = yellow  (toggle onion skin)
  *
  * Adjust the pin numbers below to match your wiring.
@@ -23,12 +22,11 @@ struct Button {
 };
 
 Button buttons[] = {
-  { 2, 'G', HIGH, 0 },  // green
-  { 3, 'R', HIGH, 0 },  // red
-  { 4, 'B', HIGH, 0 },  // blue
+  { 2, 'Y', HIGH, 0 },  // yellow
+  { 4, 'R', HIGH, 0 },  // red
   { 5, 'W', HIGH, 0 },  // white
-  { 6, 'K', HIGH, 0 },  // black
-  { 7, 'Y', HIGH, 0 },  // yellow
+  { 6, 'G', HIGH, 0 },  // green
+  { 7, 'B', HIGH, 0 },  // blue
 };
 
 const unsigned long DEBOUNCE_MS = 25;

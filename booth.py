@@ -13,10 +13,9 @@ Arduino sends a single ASCII char per button press over USB serial @ 9600:
   R red    -> delete last picture
   B blue   -> build movie and play it back
   W white  -> yes (save & queue for cloud upload)
-  K black  -> no  (keep working)
-  Y yellow -> toggle onion skin
+  Y yellow -> toggle onion skin / no (keep working)
 
-Keyboard fallback with --port none: g/r/b/w/k/y mirror the buttons; q quits.
+Keyboard fallback with --port none: g/r/b/w/y mirror the buttons; q quits.
 
 Setup (Windows):
     py -m venv .venv
@@ -28,6 +27,7 @@ Setup (Windows):
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 import shutil
@@ -64,6 +64,21 @@ CLOUD_DIR = Path('cloud_outbox')   # external uploader picks files up from here
 SERIAL_BAUD = 9600
 DIGICAM_DEFAULT_URL = 'http://localhost:5513'
 DIGICAM_CAPTURE_TIMEOUT_S = 20.0
+LOG_FILE = Path('booth.log')
+
+
+def _setup_logging():
+    fmt = '%(asctime)s %(levelname)-7s %(message)s'
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format=fmt,
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+log = logging.getLogger('booth')
 
 
 # ---- Button event source ----------------------------------------------------
@@ -73,7 +88,7 @@ class ButtonSource:
 
     KEY_MAP = {
         ord('g'): 'G', ord('r'): 'R', ord('b'): 'B',
-        ord('w'): 'W', ord('k'): 'K', ord('y'): 'Y',
+        ord('w'): 'W', ord('y'): 'Y',
     }
 
     def __init__(self, port: str | None):
@@ -92,7 +107,7 @@ class ButtonSource:
             if data:
                 for ch in data:
                     c = chr(ch).upper()
-                    if c in 'GRBWKY':
+                    if c in 'GRBWY':
                         return c
         if key != -1 and key in self.KEY_MAP:
             return self.KEY_MAP[key]
@@ -150,12 +165,15 @@ class DigiCamBackend:
         if requests is None:
             raise RuntimeError('requests not installed; run: pip install requests')
         self.base = base_url.rstrip('/')
-        # Prime connectivity and try to start live view so /liveview.jpg serves.
-        self._slc({'slc': 'list', 'param1': 'cameras'})  # raises if unreachable
+        log.info('DigiCam connecting to %s', self.base)
+        result = self._slc({'slc': 'list', 'param1': 'cameras'})  # raises if unreachable
+        log.info('DigiCam cameras: %s', result)
         self._try_start_liveview()
 
-    def _slc(self, params: dict) -> str:
-        r = requests.get(self.base, params=params, timeout=5)
+    def _slc(self, params: dict, timeout: float = 5) -> str:
+        log.debug('DigiCam SLC request: %s', params)
+        r = requests.get(self.base, params=params, timeout=timeout)
+        log.debug('DigiCam SLC response: HTTP %s — %s', r.status_code, r.text[:200])
         r.raise_for_status()
         return _strip_html(r.text)
 
@@ -168,37 +186,60 @@ class DigiCamBackend:
         ):
             try:
                 self._slc(params)
+                log.info('Live view started with params: %s', params)
                 break
-            except Exception:
+            except Exception as e:
+                log.debug('Live view attempt failed (%s): %s', params, e)
                 continue
 
     def _get_last_captured(self) -> str:
         try:
-            return self._slc({'slc': 'get', 'param1': 'lastcaptured'})
-        except Exception:
+            result = self._slc({'slc': 'get', 'param1': 'lastcaptured'})
+            return result
+        except Exception as e:
+            log.warning('_get_last_captured failed: %s', e)
             return ''
 
     def read_preview(self) -> np.ndarray | None:
         try:
             r = requests.get(f'{self.base}/liveview.jpg', timeout=1.5)
             if r.status_code != 200 or not r.content:
+                log.debug('Live view frame unavailable: HTTP %s, %d bytes',
+                          r.status_code, len(r.content))
                 return None
             arr = np.frombuffer(r.content, dtype=np.uint8)
             return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        except Exception:
+        except Exception as e:
+            log.debug('read_preview exception: %s', e)
             return None
 
     def capture(self, stem: Path) -> Path | None:
         before = self._get_last_captured()
+        log.info('Capture triggered — lastcaptured before: %s', before)
         try:
-            self._slc({'slc': 'capture'})
-        except Exception:
+            # Use a short timeout — DigiCamControl blocks the response while it
+            # processes the image, but the shutter fires immediately. We don't
+            # need the response; we detect the capture by polling lastcaptured.
+            self._slc({'slc': 'capture'}, timeout=0.5)
+        except requests.exceptions.Timeout:
+            log.debug('Capture SLC timed out as expected — polling for result')
+        except Exception as e:
+            log.error('Capture SLC call failed: %s', e)
             return None
         deadline = time.time() + DIGICAM_CAPTURE_TIMEOUT_S
         while time.time() < deadline:
             current = self._get_last_captured()
             if current and current != before:
+                log.info('New capture detected: %s', current)
                 src = Path(current)
+                if not src.is_absolute():
+                    # DigiCamControl sometimes returns just a filename — search
+                    # the session download folder for it.
+                    session_folder = self._get_session_folder()
+                    if session_folder:
+                        candidate = Path(session_folder) / src.name
+                        log.debug('Relative path received, trying session folder: %s', candidate)
+                        src = candidate
                 if src.exists():
                     dest = stem.with_suffix(src.suffix.lower() or '.jpg')
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -206,15 +247,45 @@ class DigiCamBackend:
                         shutil.move(str(src), str(dest))
                     except OSError:
                         shutil.copy2(src, dest)
+                    log.info('Frame saved to %s', dest)
                     return dest
+                else:
+                    log.warning('Capture path reported but file not found: %s', src)
             time.sleep(0.15)
+        log.error('Capture timed out after %.0fs — no new file appeared', DIGICAM_CAPTURE_TIMEOUT_S)
         return None
+
+    def _get_session_folder(self) -> str:
+        try:
+            result = self._slc({'slc': 'get', 'param1': 'session.folder'})
+            log.debug('Session folder: %s', result)
+            return result
+        except Exception as e:
+            log.warning('Could not get session.folder: %s', e)
+            return ''
+
+    def lock_exposure(self):
+        """Read current ISO/shutter/aperture and pin them so auto-exposure stops."""
+        props = [
+            ('camera.isocurrent',          'camera.iso'),
+            ('camera.shutterspeedcurrent', 'camera.shutter'),
+            ('camera.aperturecurrent',     'camera.aperture'),
+        ]
+        for get_param, set_param in props:
+            try:
+                value = self._slc({'slc': 'get', 'param1': get_param})
+                if value:
+                    self._slc({'slc': 'set', 'param1': set_param, 'param2': value})
+                    log.info('Exposure locked — %s = %s', set_param, value)
+            except Exception as e:
+                log.warning('Could not lock %s: %s', set_param, e)
 
     def release(self):
         try:
             self._slc({'slc': 'do', 'param1': 'LiveViewWnd_Hide'})
-        except Exception:
-            pass
+            log.info('Live view hidden')
+        except Exception as e:
+            log.debug('release exception: %s', e)
 
 
 # ---- Session state ----------------------------------------------------------
@@ -277,16 +348,40 @@ class Session:
 
 # ---- Rendering helpers ------------------------------------------------------
 
+BUTTON_LEGEND = [
+    ('GREEN',  ( 50, 200,  50), 'TAKE PICTURE'),
+    ('RED',    ( 50,  50, 220), 'DELETE LAST'),
+    ('BLUE',   (220, 100,  50), 'PLAY MOVIE'),
+    ('WHITE',  (220, 220, 220), 'SAVE'),
+    ('YELLOW', ( 50, 220, 220), 'ONION SKIN'),
+]
+
+
 def draw_hud(frame: np.ndarray, frames_count: int, onion: bool,
              capturing: bool) -> np.ndarray:
     out = frame.copy()
     h, w = out.shape[:2]
-    cv2.rectangle(out, (0, 0), (w, 70), (0, 0, 0), -1)
-    cv2.putText(out, f'Frames: {frames_count}', (20, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3)
+
+    # Top bar — two rows: button legend + status
+    cv2.rectangle(out, (0, 0), (w, 110), (0, 0, 0), -1)
+
+    # Row 1: button legend spread across the width
+    n = len(BUTTON_LEGEND)
+    col_w = w // n
+    for i, (label, color, action) in enumerate(BUTTON_LEGEND):
+        x = i * col_w + 10
+        cv2.putText(out, label, (x, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.putText(out, action, (x, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+    # Row 2: frame count and onion state
+    cv2.putText(out, f'Frames: {frames_count}', (20, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
     if onion:
-        cv2.putText(out, 'ONION', (w - 200, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 220, 255), 3)
+        cv2.putText(out, 'ONION ON', (w - 180, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 220, 255), 2)
+
     if capturing:
         cv2.putText(out, 'CAPTURING...', (w // 2 - 200, h // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 255), 5)
@@ -357,6 +452,11 @@ def play_movie(path: Path, buttons: ButtonSource) -> None:
             ok, frame = cap.read()
             if not ok:
                 break
+            h, w = frame.shape[:2]
+            cv2.rectangle(frame, (0, h - 50), (w, h), (0, 0, 0), -1)
+            cv2.putText(frame, 'PUSH ANY BUTTON TO STOP',
+                        (w // 2 - 260, h - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(delay) & 0xFF
             key = -1 if key == 255 else key
@@ -383,6 +483,8 @@ def make_backend(kind: str, camera_index: int, digicam_url: str):
 
 def run(backend_kind: str, camera_index: int, digicam_url: str,
         port: str | None, fullscreen: bool) -> int:
+    _setup_logging()
+    log.info('Starting booth — backend=%s port=%s url=%s', backend_kind, port, digicam_url)
     SESSIONS_DIR.mkdir(exist_ok=True)
     SAVED_DIR.mkdir(exist_ok=True)
     CLOUD_DIR.mkdir(exist_ok=True)
@@ -406,6 +508,8 @@ def run(backend_kind: str, camera_index: int, digicam_url: str,
             path = backend.capture(session.next_stem())
             if path is not None:
                 session.register(path)
+                if len(session.frames) == 1 and hasattr(backend, 'lock_exposure'):
+                    backend.lock_exposure()
         finally:
             capture_state['in_flight'] = False
 
@@ -432,7 +536,7 @@ def run(backend_kind: str, camera_index: int, digicam_url: str,
             if pending_save is not None:
                 display = big_message(display, [
                     'Save this movie?',
-                    'WHITE = yes    BLACK = keep working',
+                    'WHITE = yes    YELLOW = keep working',
                 ])
 
             if time.time() < flash_until:
@@ -459,7 +563,7 @@ def run(backend_kind: str, camera_index: int, digicam_url: str,
                     session.cleanup_if_empty()
                     session = Session(SESSIONS_DIR)
                     onion = False
-                elif event == 'K':
+                elif event == 'Y':
                     pending_save = None
                 continue
 
