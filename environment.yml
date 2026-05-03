@@ -7,3 +7,4 @@ dependencies:
   - numpy>=1.26
   - pyserial>=3.5
   - requests>=2.32
+  - pillow>=10.0
